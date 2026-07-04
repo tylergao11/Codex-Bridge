@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Get-ProjectRoot
 $oldCodexHome = $env:CODEX_HOME
 $oldPort = $env:DEEPSEEK_RESPONSES_PROXY_PORT
+$oldHost = $env:DEEPSEEK_RESPONSES_PROXY_HOST
 $oldProcessDeepSeekKey = $env:DEEPSEEK_API_KEY
 $testHome = Join-Path $projectRoot ("tmp\system-codex-home-{0}-{1}" -f $PID, [guid]::NewGuid().ToString("N"))
 
@@ -44,6 +45,7 @@ enabled = true
 
   $env:CODEX_HOME = $testHome
   $env:DEEPSEEK_RESPONSES_PROXY_PORT = $testPort
+  $env:DEEPSEEK_RESPONSES_PROXY_HOST = "127.0.0.1"
 
   & "$PSScriptRoot\install.ps1" -ApiKey "test-key-for-local-system-torture" -NoPersistApiKey
   $configPath = Join-Path $testHome "config.toml"
@@ -72,5 +74,6 @@ enabled = true
   try { & "$PSScriptRoot\stop.ps1" | Out-Null } catch {}
   if ($null -eq $oldCodexHome) { Remove-Item Env:\CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $oldCodexHome }
   if ($null -eq $oldPort) { Remove-Item Env:\DEEPSEEK_RESPONSES_PROXY_PORT -ErrorAction SilentlyContinue } else { $env:DEEPSEEK_RESPONSES_PROXY_PORT = $oldPort }
+  if ($null -eq $oldHost) { Remove-Item Env:\DEEPSEEK_RESPONSES_PROXY_HOST -ErrorAction SilentlyContinue } else { $env:DEEPSEEK_RESPONSES_PROXY_HOST = $oldHost }
   if ($null -eq $oldProcessDeepSeekKey) { Remove-Item Env:\DEEPSEEK_API_KEY -ErrorAction SilentlyContinue } else { $env:DEEPSEEK_API_KEY = $oldProcessDeepSeekKey }
 }

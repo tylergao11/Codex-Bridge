@@ -21,14 +21,20 @@ function Get-ProxyPort {
   return 18081
 }
 
+function Get-ProxyHost {
+  if ($env:DEEPSEEK_RESPONSES_PROXY_HOST) { return $env:DEEPSEEK_RESPONSES_PROXY_HOST }
+  return "127.0.0.1"
+}
+
 function Get-DeepSeekCodexDefaults {
   $port = Get-ProxyPort
+  $hostName = Get-ProxyHost
   return [pscustomobject]@{
     Model = "deepseek-v4-pro"
     Provider = "deepseek"
     ReasoningEffort = "xhigh"
     ProviderName = "DeepSeek Pro (local Responses proxy)"
-    BaseUrl = "http://127.0.0.1:$port/v1"
+    BaseUrl = "http://$hostName`:$port/v1"
     EnvKey = "DEEPSEEK_API_KEY"
     WireApi = "responses"
   }
