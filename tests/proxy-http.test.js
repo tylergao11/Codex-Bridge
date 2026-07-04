@@ -194,6 +194,20 @@ async function main() {
     assert.strictEqual(tool.body.output[0].call_id, 'call_mock_a');
     assert.strictEqual(tool.body.output[1].call_id, 'call_mock_b');
 
+    const toolFollow = await requestJson(`${proxyUrl}/v1/responses`, {
+      model: 'deepseek-v4-pro',
+      previous_response_id: tool.body.id,
+      input: [
+        { type: 'function_call_output', call_id: 'call_mock_a', output: 'a' },
+        { type: 'function_call_output', call_id: 'call_mock_b', output: 'b' },
+      ],
+    });
+    assert.strictEqual(toolFollow.status, 200);
+    const toolFollowUpstream = upstreamRequests[upstreamRequests.length - 1];
+    const assistantWithCalls = toolFollowUpstream.messages.find((message) => message.role === 'assistant' && Array.isArray(message.tool_calls));
+    assert.strictEqual(assistantWithCalls.tool_calls.length, 2);
+    assert.strictEqual(toolFollowUpstream.messages.filter((message) => message.role === 'tool').length, 2);
+
     const stream = await requestSse(`${proxyUrl}/v1/responses`, { model: 'deepseek-v4-pro', input: 'hello stream', stream: true });
     assert.strictEqual(stream.status, 200);
     assert(stream.raw.includes('response.output_text.delta'));
