@@ -4,6 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Reuse HTTPS connections to avoid TLS handshake per request (~200ms saving)
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 6 });
+
 const HOST = process.env.DEEPSEEK_RESPONSES_PROXY_HOST || '127.0.0.1';
 const PORT = Number(process.env.DEEPSEEK_RESPONSES_PROXY_PORT || 18081);
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
@@ -34,8 +37,8 @@ function modelCard(id, displayName) {
     supported_reasoning_levels: SUPPORTED_REASONING_LEVELS,
     object: 'model',
     owned_by: 'deepseek',
-    context_window: 128000,
-    max_context_window: 128000,
+    context_window: 1000000,
+    max_context_window: 1000000,
     supports_parallel_tool_calls: true,
     supports_reasoning_summaries: false,
     default_reasoning_summary: 'none',
@@ -44,7 +47,6 @@ function modelCard(id, displayName) {
     shell_type: 'shell_command',
     apply_patch_tool_type: 'freeform',
     web_search_tool_type: 'text_and_image',
-    truncation_policy: { mode: 'tokens', limit: 10000 },
     supported_in_api: true,
     visibility: 'list',
     additional_speed_tiers: [],
@@ -360,6 +362,8 @@ function convertTools(tools) {
       },
     });
   }
+  // Sort by name for deterministic cache prefix regardless of Codex tool ordering
+  converted.sort((a, b) => a.function.name.localeCompare(b.function.name));
   return converted.length > 0 ? converted : undefined;
 }
 
@@ -370,7 +374,11 @@ function buildChatRequest(body) {
   const previousId = body.previous_response_id;
   const previous = previousId ? responseStore.get(previousId) : undefined;
   if (previous && !inputHasFunctionCall(body.input)) {
-    messages.push(...previous);
+    // Skip the system message from previous if we already added one
+    const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
+    for (let i = startIdx; i < previous.length; i++) {
+      messages.push(previous[i]);
+    }
     messages.push(...convertInputItems(body.input));
   } else {
     messages.push(...convertInputItems(body.input));
@@ -414,6 +422,7 @@ function postDeepSeek(json) {
         'content-length': Buffer.byteLength(body),
       },
       timeout: timeoutMs,
+      agent: httpsAgent,
     }, (resp) => {
       const chunks = [];
       resp.on('data', (chunk) => chunks.push(chunk));
@@ -452,6 +461,7 @@ function postDeepSeekStream(json, onChunk, onOpen) {
         'content-length': Buffer.byteLength(body),
       },
       timeout: timeoutMs,
+      agent: httpsAgent,
     }, (resp) => {
       let buffer = '';
       const errorChunks = [];
