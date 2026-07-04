@@ -7,8 +7,19 @@ $projectRoot = Get-ProjectRoot
 $oldCodexHome = $env:CODEX_HOME
 $oldPort = $env:DEEPSEEK_RESPONSES_PROXY_PORT
 $oldProcessDeepSeekKey = $env:DEEPSEEK_API_KEY
-$testHome = Join-Path $projectRoot "tmp\system-codex-home"
-$testPort = "19081"
+$testHome = Join-Path $projectRoot ("tmp\system-codex-home-{0}-{1}" -f $PID, [guid]::NewGuid().ToString("N"))
+
+function Get-FreeTcpPort {
+  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 0)
+  $listener.Start()
+  try {
+    return [string]$listener.LocalEndpoint.Port
+  } finally {
+    $listener.Stop()
+  }
+}
+
+$testPort = Get-FreeTcpPort
 
 function Assert-Text {
   param([string]$Text, [string]$Pattern, [string]$Message)
@@ -39,7 +50,7 @@ enabled = true
   $config = Get-Content -LiteralPath $configPath -Raw
   Assert-Text $config '(?m)^model_provider\s*=\s*"deepseek"\s*$' "install did not set model_provider."
   Assert-Text $config '(?m)^model\s*=\s*"deepseek-v4-pro"\s*$' "install did not set DeepSeek model."
-  Assert-Text $config 'http://127\.0\.0\.1:19081/v1' "install did not use custom proxy port."
+  Assert-Text $config ([regex]::Escape("http://127.0.0.1:$testPort/v1")) "install did not use custom proxy port."
   Assert-Text $config '(?m)^\[model_providers\.deepseek\]\s*$' "install did not write provider block."
   Assert-Text $config '(?m)^\[marketplaces\.local\]\s*$' "install removed existing marketplace block."
 
