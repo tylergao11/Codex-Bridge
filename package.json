@@ -19,7 +19,8 @@
     "verify": "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
     "smoke": "powershell -ExecutionPolicy Bypass -File scripts/codex-smoke.ps1",
     "torture": "powershell -ExecutionPolicy Bypass -File scripts/agent-torture.ps1",
-    "torture:concurrent": "powershell -ExecutionPolicy Bypass -File scripts/agent-concurrency.ps1"
+    "torture:concurrent": "powershell -ExecutionPolicy Bypass -File scripts/agent-concurrency.ps1",
+    "torture:soak": "powershell -ExecutionPolicy Bypass -File scripts/agent-soak.ps1"
   },
   "engines": {
     "node": ">=18"

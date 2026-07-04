@@ -101,9 +101,10 @@ For a stronger agent-runtime test:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\agent-torture.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\agent-concurrency.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\agent-soak.ps1
 ```
 
-These launch real Codex agent runs through the bridge in temporary workspaces and verify read, write, patch, shell command, error-recovery, multi-step context, and concurrent agent behavior.
+These launch real Codex agent runs through the bridge in temporary workspaces and verify read, write, patch, shell command, error-recovery, multi-step context, concurrent agent behavior, and repeated short agent sessions.
 
 ## Restore
 
