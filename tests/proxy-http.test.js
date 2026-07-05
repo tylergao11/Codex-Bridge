@@ -171,6 +171,7 @@ async function main() {
     assert.strictEqual(models.models[0].supports_parallel_tool_calls, true);
 
     const normal = await requestJson(`${proxyUrl}/v1/responses`, { model: 'deepseek-v4-pro', input: 'hello' });
+    if (normal.status !== 200) { console.error('TEST ERROR body:', JSON.stringify(normal.body)); }
     assert.strictEqual(normal.status, 200);
     assert.strictEqual(normal.body.output[0].content[0].text, 'mock ok');
     assert.strictEqual(normal.body.usage.input_tokens_details.cached_tokens, 6);
@@ -190,9 +191,12 @@ async function main() {
       tools: [{ type: 'shell_command', input_schema: { type: 'object', properties: {} } }],
     });
     assert.strictEqual(tool.status, 200);
-    assert.strictEqual(tool.body.output.length, 2);
-    assert.strictEqual(tool.body.output[0].call_id, 'call_mock_a');
-    assert.strictEqual(tool.body.output[1].call_id, 'call_mock_b');
+    // DEEPSEEK_SHOW_REASONING adds a reasoning item at output[0]
+    assert.strictEqual(tool.body.output.length, 3);
+    assert.strictEqual(tool.body.output[0].type, 'reasoning');
+    assert.strictEqual(tool.body.output[0].summary[0].text, 'hidden tool thought');
+    assert.strictEqual(tool.body.output[1].call_id, 'call_mock_a');
+    assert.strictEqual(tool.body.output[2].call_id, 'call_mock_b');
 
     const toolFollow = await requestJson(`${proxyUrl}/v1/responses`, {
       model: 'deepseek-v4-pro',
