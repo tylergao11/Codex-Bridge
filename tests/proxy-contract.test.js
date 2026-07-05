@@ -4,6 +4,7 @@ const {
   cachePrefixHash,
   convertInputItems,
   convertTools,
+  mapReasoningEffort,
   modelCard,
   responseFromChat,
   sseEventsForResponse,
@@ -14,11 +15,11 @@ function testModelCardShape() {
   const card = modelCard('deepseek-v4-pro', 'DeepSeek V4 Pro');
   assert.strictEqual(card.id, 'deepseek-v4-pro');
   assert.strictEqual(card.base_instructions, '');
-  assert.deepStrictEqual(card.truncation_policy, { mode: 'tokens', limit: 10000 });
+  assert.deepStrictEqual(card.truncation_policy, { mode: 'tokens', limit: 800000 });
   assert.strictEqual(card.supports_parallel_tool_calls, true);
   assert.strictEqual(card.shell_type, 'shell_command');
   assert.strictEqual(card.apply_patch_tool_type, 'freeform');
-  assert.strictEqual(card.context_window, 128000);
+  assert.strictEqual(card.context_window, 1000000);
 }
 
 function testToolConversion() {
@@ -132,7 +133,20 @@ function testUsageAndPrefixHash() {
   assert.strictEqual(a, b);
 }
 
+function testReasoningEffortMapping() {
+  // Per DeepSeek docs: low/medium → high, xhigh/max → max
+  assert.strictEqual(mapReasoningEffort('xhigh'), 'max');
+  assert.strictEqual(mapReasoningEffort('max'), 'max');
+  assert.strictEqual(mapReasoningEffort('high'), 'high');
+  assert.strictEqual(mapReasoningEffort('medium'), 'high');
+  assert.strictEqual(mapReasoningEffort('low'), 'high');
+  assert.strictEqual(mapReasoningEffort('unknown'), 'high');
+  assert.strictEqual(mapReasoningEffort(null), 'high');
+  assert.strictEqual(mapReasoningEffort(undefined), 'high');
+}
+
 testModelCardShape();
+testReasoningEffortMapping();
 testToolConversion();
 testInputConversionKeepsParallelToolCallsTogether();
 testBuildChatRequest();

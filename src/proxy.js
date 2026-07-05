@@ -12,18 +12,37 @@ const PORT = Number(process.env.DEEPSEEK_RESPONSES_PROXY_PORT || 18081);
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
 const LOG_PATH = path.join(__dirname, 'proxy.log');
+const STORE_PATH = path.join(__dirname, 'response-store.json');
 
 const responseStore = new Map();
 let sequenceNumber = 0;
 const KNOWN_DEEPSEEK_MODELS = new Set(['deepseek-v4-pro', 'deepseek-v4-flash']);
 const MAX_STORED_RESPONSES = Number(process.env.DEEPSEEK_RESPONSES_STORE_LIMIT || 256);
 
+// DeepSeek thinking mode only supports two effective effort levels:
+//   high → standard reasoning; max → deepest reasoning.
+// low/medium are mapped to high; xhigh is mapped to max.
+// We advertise only high and xhigh to match Codex expectations.
 const SUPPORTED_REASONING_LEVELS = [
-  { effort: 'low', description: 'Fast responses with lighter reasoning' },
-  { effort: 'medium', description: 'Balances speed and reasoning depth' },
-  { effort: 'high', description: 'Greater reasoning depth' },
-  { effort: 'xhigh', description: 'Extra high reasoning depth' },
+  { effort: "high", description: "Standard reasoning depth" },
+  { effort: "xhigh", description: "Maximum reasoning depth (maps to DeepSeek max)" },
 ];
+
+// Maps Codex reasoning_effort values to DeepSeek-compatible values.
+// Per DeepSeek docs: low/medium → high; xhigh → max.
+function mapReasoningEffort(effort) {
+  if (!effort) return "high";
+  switch (effort.toLowerCase()) {
+    case "xhigh":
+    case "max":
+      return "max";
+    case "high":
+    case "medium":
+    case "low":
+    default:
+      return "high";
+  }
+}
 
 function modelCard(id, displayName) {
   return {
@@ -47,6 +66,7 @@ function modelCard(id, displayName) {
     shell_type: 'shell_command',
     apply_patch_tool_type: 'freeform',
     web_search_tool_type: 'text_and_image',
+    truncation_policy: { mode: 'tokens', limit: 800000 },
     supported_in_api: true,
     visibility: 'list',
     additional_speed_tiers: [],
@@ -123,13 +143,58 @@ function logUsage(responseId, usage, prefixHash) {
   log(`DONE response=${responseId} prefix=${prefixHash} tokens in=${normalized.input_tokens} out=${normalized.output_tokens} cache_hit=${normalized.prompt_cache_hit_tokens} cache_miss=${normalized.prompt_cache_miss_tokens} cached=${normalized.input_tokens_details.cached_tokens}`);
 }
 
+function persistStore() {
+  const snapshot = Array.from(responseStore.entries());
+  try { fs.writeFileSync(STORE_PATH, JSON.stringify(snapshot)); } catch (err) {
+    log('store persist: ' + err.message);
+  }
+}
+
+function loadStore() {
+  try {
+    if (!fs.existsSync(STORE_PATH)) return;
+    const raw = fs.readFileSync(STORE_PATH, 'utf8');
+    const entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) return;
+    for (const [id, msgs] of entries) {
+      if (typeof id === 'string' && Array.isArray(msgs)) {
+        responseStore.set(id, msgs);
+      }
+    }
+    log('store loaded ' + responseStore.size + ' responses');
+  } catch (err) {
+    log('store load error: ' + (err.message || String(err)));
+    try { fs.unlinkSync(STORE_PATH); } catch {}
+  }
+}
+
 function rememberResponse(id, messages) {
   responseStore.set(id, messages);
+  // Maintain reasoningIndex: each assistant tool_call gets its reasoning_content indexed.
+  for (const m of messages) {
+    if (m.role === 'assistant' && m.reasoning_content && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc.id) reasoningIndex.set(tc.id, m.reasoning_content);
+      }
+    }
+  }
   while (responseStore.size > MAX_STORED_RESPONSES) {
     const oldest = responseStore.keys().next().value;
     if (!oldest) break;
+    // Clean up reasoning entries for evicted response
+    const evicted = responseStore.get(oldest);
+    if (evicted) {
+      for (const m of evicted) {
+        if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+          for (const tc of m.tool_calls) {
+            if (tc.id) reasoningIndex.delete(tc.id);
+          }
+        }
+      }
+    }
     responseStore.delete(oldest);
   }
+  persistStore();
 }
 
 function log(line) {
@@ -272,16 +337,12 @@ function textFromContent(content) {
   }).filter(Boolean).join('\n');
 }
 
+// O(1) index: call_id → reasoning_content for tool-call continuation.
+// Populated by rememberResponse whenever an assistant message has tool_calls.
+const reasoningIndex = new Map();
+
 function findReasoningContent(callId) {
-  for (const msgs of responseStore.values()) {
-    for (const m of msgs) {
-      if (m.role === 'assistant' && m.reasoning_content && Array.isArray(m.tool_calls)) {
-        const matched = m.tool_calls.some((tc) => tc.id === callId || tc.call_id === callId);
-        if (matched) return m.reasoning_content;
-      }
-    }
-  }
-  return '';
+  return reasoningIndex.get(callId) || '';
 }
 
 function convertInputItems(input) {
@@ -293,9 +354,12 @@ function convertInputItems(input) {
   function flushPendingCalls() {
     if (pendingCalls.length === 0) return;
     const reasoning = pendingCalls.map((call) => call.reasoning).find(Boolean) || '';
+    // Mark ALL function_calls as already-executed history.
+    // Codex replays them in input; DeepSeek must not re-execute.
+    // Non-empty content signals to DeepSeek: "this turn is done, don't continue."
     messages.push({
       role: 'assistant',
-      content: '',
+      content: null,
       ...(reasoning ? { reasoning_content: reasoning } : {}),
       tool_calls: pendingCalls.map((call) => ({
         id: call.id,
@@ -371,15 +435,44 @@ function buildChatRequest(body) {
   const messages = [];
   if (body.instructions) messages.push({ role: 'system', content: String(body.instructions) });
 
+  // Inject bridge-level system prompt (appended after Codex instructions).
+  // Fixed position = part of cache prefix from round 2 onward → 99% hit.
+  const injected = process.env.DEEPSEEK_INJECT_SYSTEM_PROMPT;
+  if (injected) messages.push({ role: 'system', content: injected });
+
   const previousId = body.previous_response_id;
   const previous = previousId ? responseStore.get(previousId) : undefined;
-  if (previous && !inputHasFunctionCall(body.input)) {
-    // Skip the system message from previous if we already added one
-    const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
-    for (let i = startIdx; i < previous.length; i++) {
-      messages.push(previous[i]);
+  if (previous) {
+    if (inputHasFunctionCall(body.input)) {
+      // Find last assistant tool call IDs from stored previous.
+      const lastIds = new Set();
+      for (let i = previous.length - 1; i >= 0; i--) {
+        const m = previous[i];
+        if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+          for (const tc of m.tool_calls) lastIds.add(tc.id);
+          break;
+        }
+      }
+      // Everything from the first matching function_call_output
+      // to the end of input is new; everything before is in previous.
+      let newItems = body.input;
+      if (lastIds.size > 0) {
+        for (let i = 0; i < body.input.length; i++) {
+          const item = body.input[i];
+          if (item && item.type === 'function_call_output' && lastIds.has(item.call_id)) {
+            newItems = body.input.slice(i);
+            break;
+          }
+        }
+      }
+      const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
+      for (let i = startIdx; i < previous.length; i++) messages.push(previous[i]);
+      messages.push(...convertInputItems(newItems));
+    } else {
+      const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
+      for (let i = startIdx; i < previous.length; i++) messages.push(previous[i]);
+      messages.push(...convertInputItems(body.input));
     }
-    messages.push(...convertInputItems(body.input));
   } else {
     messages.push(...convertInputItems(body.input));
   }
@@ -391,11 +484,22 @@ function buildChatRequest(body) {
     parallel_tool_calls: body.parallel_tool_calls !== false,
   };
 
-  const maxTokens = body.max_output_tokens || body.max_tokens;
-  if (maxTokens) req.max_tokens = maxTokens;
-  if (typeof body.temperature === 'number') req.temperature = body.temperature;
+  // Reasoning effort: read from Codex request, map to DeepSeek-compatible values.
+  // Codex sends reasoning_effort (top-level) or reasoning.effort (nested).
+  const codexEffort = body.reasoning_effort || (body.reasoning && body.reasoning.effort) || 'xhigh';
+  req.reasoning_effort = mapReasoningEffort(codexEffort);
+
+  // max_tokens: Codex's max_output_tokens assumes GPT-style counting (output only).
+  // DeepSeek counts reasoning tokens inside max_tokens, so we multiply by 2.5x
+  // to leave headroom for the thinking chain while still enforcing a ceiling.
+  // Without this, a runaway model could waste tokens on unbounded output.
+  if (body.max_output_tokens && typeof body.max_output_tokens === 'number') {
+    req.max_tokens = Math.floor(body.max_output_tokens * 2.5);
+  }
+
+  // Do NOT forward temperature — thinking mode is always enabled and
+  // DeepSeek's thinking mode is incompatible with temperature.
   req.thinking = { type: 'enabled' };
-  req.reasoning_effort = 'max';
 
   const tools = convertTools(body.tools);
   if (tools) {
@@ -422,7 +526,7 @@ function postDeepSeek(json) {
         'content-length': Buffer.byteLength(body),
       },
       timeout: timeoutMs,
-      agent: httpsAgent,
+      ...(url.protocol === "https:" ? { agent: httpsAgent } : {}),
     }, (resp) => {
       const chunks = [];
       resp.on('data', (chunk) => chunks.push(chunk));
@@ -461,7 +565,7 @@ function postDeepSeekStream(json, onChunk, onOpen) {
         'content-length': Buffer.byteLength(body),
       },
       timeout: timeoutMs,
-      agent: httpsAgent,
+      ...(url.protocol === "https:" ? { agent: httpsAgent } : {}),
     }, (resp) => {
       let buffer = '';
       const errorChunks = [];
@@ -560,12 +664,13 @@ function responseFromChat(body, chatReq, chatResp) {
   if (output.some((item) => item.type === 'function_call')) {
     stored.push({
       role: 'assistant',
-      content: message.content || '',
+      content: message.content || null,
       ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
       tool_calls: returnedToolCalls,
     });
   } else {
-    stored.push({ role: 'assistant', content: message.content || '', ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
+    // No tool calls → reasoning_content not needed in history (per DeepSeek docs)
+    stored.push({ role: 'assistant', content: message.content || '' });
   }
   rememberResponse(id, stored);
   logUsage(id, chatResp.usage, cachePrefixHash(body));
@@ -726,7 +831,7 @@ async function streamResponseFromChat(body, chatReq, res) {
   if (returnedToolCalls.length > 0) {
     stored.push({
       role: 'assistant',
-      content: '',
+      content: null,
       ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
       tool_calls: returnedToolCalls.map((item) => ({
         id: item.call_id,
@@ -735,7 +840,8 @@ async function streamResponseFromChat(body, chatReq, res) {
       })),
     });
   } else {
-    stored.push({ role: 'assistant', content: text, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
+    // No tool calls → reasoning_content not needed in history (per DeepSeek docs)
+    stored.push({ role: 'assistant', content: text });
   }
   rememberResponse(id, stored);
   logUsage(id, usage, cachePrefixHash(body));
@@ -804,6 +910,14 @@ function createServer() {
 }
 
 function startServer() {
+  loadStore();
+  // Log injected system prompt hash for KV cache stability monitoring.
+  // If this hash changes between restarts, all cached prefixes are invalidated.
+  const injected = process.env.DEEPSEEK_INJECT_SYSTEM_PROMPT;
+  if (injected) {
+    const injectedHash = stableHash(injected);
+    log('KV_CACHE injected_system_prompt_hash=' + injectedHash + ' (change invalidates all cached prefixes)');
+  }
   const server = createServer();
   server.listen(PORT, HOST, () => {
     log(`listening on http://${HOST}:${PORT}/v1 -> ${DEEPSEEK_BASE_URL}`);
@@ -825,6 +939,7 @@ module.exports = {
   convertTools,
   createServer,
   inputHasFunctionCall,
+  mapReasoningEffort,
   modelCard,
   normalizeDeepSeekModel,
   requestModuleForUrl,
