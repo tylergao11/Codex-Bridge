@@ -80,6 +80,27 @@ function testBuildChatRequest() {
   assert.strictEqual(req.tools[0].function.name, 'shell_command');
 }
 
+function testImageInputIsDowngradedToStableText() {
+  const req = buildChatRequest({
+    model: 'deepseek-v4-pro',
+    input: [{
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_text', text: 'what is in this image?' },
+        { type: 'input_image', image_url: 'data:image/png;base64,DYNAMIC_IMAGE_BYTES' },
+      ],
+    }],
+  });
+
+  const userMessage = req.messages.find((message) => message.role === 'user');
+  assert.strictEqual(typeof userMessage.content, 'string');
+  assert(userMessage.content.includes('DeepSeek image input is not supported'));
+  assert(!userMessage.content.includes('DYNAMIC_IMAGE_BYTES'));
+  assert.strictEqual(userMessage.image_url, undefined);
+  assert.strictEqual(userMessage.image_data, undefined);
+}
+
 function testResponseToolCallsAreNotCollapsed() {
   const response = responseFromChat(
     { model: 'deepseek-v4-pro' },
@@ -150,6 +171,7 @@ testReasoningEffortMapping();
 testToolConversion();
 testInputConversionKeepsParallelToolCallsTogether();
 testBuildChatRequest();
+testImageInputIsDowngradedToStableText();
 testResponseToolCallsAreNotCollapsed();
 testUsageAndPrefixHash();
 
