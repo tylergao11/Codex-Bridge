@@ -427,8 +427,80 @@ function writeSse(res, type, data) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+// Extract image URLs from Codex content parts for DeepSeek top-level message fields.
+// DeepSeek V4 expects images as top-level message fields (image_url / image_data),
+// NOT inside the content array. The content field must be a plain string.
+// Returns { image_url?: string, image_data?: string } or null if no images.
+function extractImagesFromContent(content) {
+  if (typeof content === 'string' || !Array.isArray(content)) return null;
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+
+    // Codex input_image
+    if (part.type === 'input_image') {
+      const rawUrl = part.image_url || part.url || '';
+      const url = typeof rawUrl === 'string' ? rawUrl : (rawUrl.url || '');
+      if (!url) continue;
+      if (url.startsWith('data:')) {
+        // Extract base64 data after the comma: "data:image/jpeg;base64,XXXX"
+        const commaIdx = url.indexOf(',');
+        return { image_data: commaIdx >= 0 ? url.slice(commaIdx + 1) : url };
+      }
+      return { image_url: url };
+    }
+
+    // Already DeepSeek image_url format (legacy content-array style — extract for top-level)
+    if (part.type === 'image_url') {
+      const imgUrl = part.image_url?.url || '';
+      if (!imgUrl) continue;
+      if (imgUrl.startsWith('data:')) {
+        const commaIdx = imgUrl.indexOf(',');
+        return { image_data: commaIdx >= 0 ? imgUrl.slice(commaIdx + 1) : imgUrl };
+      }
+      return { image_url: imgUrl };
+    }
+  }
+  return null;
+}
+
+// Sanitize a replayed message that may contain old-format image_url inside the
+// content array. Moves images to top-level fields and ensures content is text-only.
+// This handles messages stored by older versions of the proxy before the image fix.
+function sanitizeReplayedMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  if (typeof msg.content === 'string') return msg; // already clean
+  if (!Array.isArray(msg.content)) return msg;
+
+  const images = extractImagesFromContent(msg.content);
+  const textParts = msg.content.filter(p => {
+    if (p && typeof p === 'object' && (p.type === 'image_url' || p.type === 'input_image')) return false;
+    return true;
+  });
+
+  // Rebuild content as text-only
+  let cleanContent = '';
+  for (const p of textParts) {
+    if (typeof p === 'string') { cleanContent += p; continue; }
+    if (!p || typeof p !== 'object') continue;
+    const t = p.text || p.input_text || p.output_text || '';
+    cleanContent += t;
+  }
+
+  const result = { ...msg, content: cleanContent };
+  if (images) {
+    if (images.image_url) result.image_url = images.image_url;
+    if (images.image_data) result.image_data = images.image_data;
+    log(`IMAGE_SANITIZE role=${msg.role} moved images from content array to top-level fields`);
+  }
+  return result;
+}
+
 // Convert Codex content parts to DeepSeek-compatible format.
-// Returns a string for text-only content, or an array for mixed text+image content.
+// Returns a string for text-only content, or an array for mixed text parts.
+// Images are NOT placed in the content array — DeepSeek V4 expects them as
+// top-level message fields (image_url / image_data). Use extractImagesFromContent()
+// to get the image fields, then add them to the message object separately.
 function convertContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -441,19 +513,9 @@ function convertContent(content) {
     }
     if (!part || typeof part !== 'object') continue;
 
-    // Codex input_image → DeepSeek image_url
-    if (part.type === 'input_image') {
-      const rawUrl = part.image_url || part.url || '';
-      const url = typeof rawUrl === 'string' ? rawUrl : (rawUrl.url || '');
-      if (url) {
-        parts.push({ type: 'image_url', image_url: { url } });
-      }
-      continue;
-    }
-
-    // Already DeepSeek format
-    if (part.type === 'image_url') {
-      parts.push(part);
+    // Images: skip in content — handled by extractImagesFromContent() as top-level fields.
+    // DeepSeek V4 API rejects image_url inside the content array (serde: "unknown variant").
+    if (part.type === 'input_image' || part.type === 'image_url') {
       continue;
     }
 
@@ -606,7 +668,27 @@ function convertInputItems(input) {
     if (item.type === 'message' || item.role) {
       flushPendingCalls();
       const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user';
-      messages.push({ role, content: convertContent(item.content) });
+      // Extract images for DeepSeek top-level fields (image_url / image_data).
+      // DeepSeek V4 expects images as separate message fields, NOT inside content array.
+      const images = extractImagesFromContent(item.content);
+      let textContent = convertContent(item.content);
+      const msg = { role, content: textContent };
+      if (images) {
+        if (images.image_url) msg.image_url = images.image_url;
+        if (images.image_data) msg.image_data = images.image_data;
+        // Text fallback: DeepSeek native API may not process image fields (silently
+        // ignored), so append a text note so the model knows an image was shared.
+        // This prevents "I don't see any image" responses while keeping image fields
+        // for deployments that DO support them (CloudBase, 0G, etc.).
+        const imgRef = images.image_url || '(base64 image)';
+        if (typeof textContent === 'string' && textContent.length > 0) {
+          msg.content = textContent + '\n\n[User shared an image: ' + imgRef + ']';
+        } else {
+          msg.content = '[User shared an image: ' + imgRef + ']';
+        }
+        log(`IMAGE_EXTRACT role=${role} image_url=${images.image_url || '(base64)'} — placed as top-level field`);
+      }
+      messages.push(msg);
       continue;
     }
     if (item.type === 'input_text') {
@@ -1032,11 +1114,11 @@ function buildChatRequest(body) {
         }
       }
       const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
-      for (let i = startIdx; i < previous.length; i++) messages.push(previous[i]);
+      for (let i = startIdx; i < previous.length; i++) messages.push(sanitizeReplayedMessage(previous[i]));
       messages.push(...convertInputItems(newItems));
     } else {
       const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
-      for (let i = startIdx; i < previous.length; i++) messages.push(previous[i]);
+      for (let i = startIdx; i < previous.length; i++) messages.push(sanitizeReplayedMessage(previous[i]));
       messages.push(...convertInputItems(body.input));
     }
   } else {

@@ -19,8 +19,28 @@
 ## 快速开始
 
 ```powershell
-.\一键配置DeepSeek.ps1    # 输入 API Key，自动完成配置
-.\一键还原ChatGPT.ps1      # 还原回 ChatGPT 默认
+.\scripts\install.ps1 -ApiKey "你的DeepSeek-API-Key"
 ```
 
 配完重启 Codex 即可。
+
+## 日常命令
+
+```powershell
+.\scripts\status.ps1    # 查看 bridge 状态
+.\scripts\stop.ps1      # 停止 bridge
+.\scripts\start.ps1     # 启动 bridge
+.\scripts\verify.ps1    # 验证 bridge 是否正常
+```
+
+### 换 API Key
+
+```powershell
+.\scripts\one-key-api-key.ps1 -ApiKey "新的Key"
+```
+
+### 还原到 ChatGPT
+
+```powershell
+.\scripts\restore.ps1
+```
