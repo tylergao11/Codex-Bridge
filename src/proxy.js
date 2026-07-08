@@ -56,20 +56,25 @@ function discoverTools() {
 const AVAILABLE_TOOLS = discoverTools();
 
 // --- Cache prefix tracking (diagnostic: logs WHY cache misses happen) ---
-const _cachePrefixHistory = new Map(); // prefixHash -> last seen data
-function diagnoseCachePrefix(body, currentHash) {
+// Two-key design: prevId stores the last-seen hash; prevId:data stores the
+// DeepSeek-facing payload signature (converted tools + instructions + injected prompt)
+// so diagnoseCachePrefix can explain WHAT changed when the hash drifts.
+const _cachePrefixHistory = new Map();
+function diagnoseCachePrefix(body, currentHash, convertedTools) {
   const prev = body.previous_response_id;
   if (!prev) return ''; // first message, no history to compare
   const lastHash = _cachePrefixHistory.get(prev);
   if (!lastHash) { _cachePrefixHistory.set(prev, currentHash); return 'first_request'; }
   if (lastHash === currentHash) return 'stable';
   _cachePrefixHistory.set(prev, currentHash);
+  // Hash changed — compare current DeepSeek-facing payload against stored baseline
   const last = _cachePrefixHistory.get(prev + ':data') || {};
-  // Compare what changed
-  const currentTools = (body.tools || []).map(t => t.name||t.type).sort().join(',');
+  const currentToolsSig = (convertedTools || []).map(t => t.function?.name || t.name || '').sort().join(',');
   const currentInstr = (body.instructions || '').replace(/\s+/g, ' ').trim();
-  if (last.tools !== currentTools) return 'tools_changed';
-  if (last.instructions !== currentInstr) return 'instructions_changed';
+  const injected = process.env.DEEPSEEK_INJECT_SYSTEM_PROMPT || '';
+  if (last.toolsSig !== currentToolsSig) return 'tools_changed';
+  if (last.instrSig !== currentInstr) return 'instructions_changed';
+  if (last.injected !== injected) return 'injected_prompt_changed';
   return 'unknown_change';
 }
 
@@ -163,18 +168,16 @@ function stableHash(value) {
   return crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
 }
 
-function cachePrefixHash(body) {
-  const toolSummary = Array.isArray(body.tools)
-    ? body.tools.map((tool) => ({
-      type: tool?.type || '',
-      name: tool?.name || '',
-      description: tool?.description || '',
-      parameters: tool?.parameters || tool?.input_schema || null,
-    }))
-    : [];
+function cachePrefixHash(body, convertedTools) {
+  // Hash the ACTUAL payload DeepSeek receives (converted tools), NOT raw Codex tools.
+  // Raw tools may differ in order, contain namespaces/oneOf/anyOf that get compiled away,
+  // but the KV cache prefix is determined by the final sorted+compiled tool definitions.
+  const toolsForHash = convertedTools || [];
+  const injected = process.env.DEEPSEEK_INJECT_SYSTEM_PROMPT || '';
   return stableHash(JSON.stringify({
     instructions: body.instructions || '',
-    tools: toolSummary,
+    injected_prompt: injected,
+    tools: toolsForHash,
   }));
 }
 
@@ -214,7 +217,31 @@ function logUsage(responseId, usage, prefixHash, cacheDiagnosis) {
   const normalized = usageFromDeepSeek(usage);
   const diag = cacheDiagnosis && cacheDiagnosis !== 'stable' ? ` cache_diag=${cacheDiagnosis}` : '';
   log(`DONE response=${responseId} prefix=${prefixHash} tokens in=${normalized.input_tokens} out=${normalized.output_tokens} cache_hit=${normalized.prompt_cache_hit_tokens} cache_miss=${normalized.prompt_cache_miss_tokens} cached=${normalized.input_tokens_details.cached_tokens}${diag}`);
+
+  // Rolling cache hit-rate summary — logged every N requests to surface drift patterns.
+  _cacheStats.requests++;
+  _cacheStats.totalInput += normalized.input_tokens;
+  _cacheStats.totalCached += normalized.input_tokens_details.cached_tokens;
+  _cacheStats.totalCacheMiss += normalized.prompt_cache_miss_tokens;
+  if (cacheDiagnosis && cacheDiagnosis !== 'stable' && cacheDiagnosis !== 'first_request') {
+    _cacheStats.prefixChanges++;
+  }
+  if (_cacheStats.requests % 10 === 0) {
+    const hitRate = _cacheStats.totalInput > 0
+      ? ((_cacheStats.totalCached / _cacheStats.totalInput) * 100).toFixed(1)
+      : '0.0';
+    log(`CACHE_SUMMARY requests=${_cacheStats.requests} cached_input_pct=${hitRate}% total_input=${_cacheStats.totalInput} total_cached=${_cacheStats.totalCached} total_miss=${_cacheStats.totalCacheMiss} prefix_changes=${_cacheStats.prefixChanges}`);
+  }
 }
+
+// Rolling cache statistics for periodic summary logging.
+const _cacheStats = {
+  requests: 0,
+  totalInput: 0,
+  totalCached: 0,
+  totalCacheMiss: 0,
+  prefixChanges: 0,
+};
 
 function persistStore() {
   // Serialize Maps as arrays for JSON storage
@@ -223,8 +250,15 @@ function persistStore() {
     const items = entry.outputItems ? [...entry.outputItems] : [];
     return [id, { messages: msgs, outputItems: items }];
   });
-  try { fs.writeFileSync(STORE_PATH, JSON.stringify(snapshot)); } catch (err) {
+  // Atomic write: write to temp file then rename, so a crash mid-write
+  // never leaves a corrupted store that nukes all conversation history.
+  const tmp = STORE_PATH + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot));
+    fs.renameSync(tmp, STORE_PATH);
+  } catch (err) {
     log('store persist: ' + err.message);
+    try { fs.unlinkSync(tmp); } catch {}
   }
 }
 
@@ -260,7 +294,8 @@ function loadStore() {
     log('reasoning index rebuilt ' + reasoningIndex.size + ' entries, outputItemIndex ' + outputItemIndex.size + ' entries');
   } catch (err) {
     log('store load error: ' + (err.message || String(err)));
-    try { fs.unlinkSync(STORE_PATH); } catch {}
+    // Don't delete — rename to .corrupted so data is recoverable.
+    try { fs.renameSync(STORE_PATH, STORE_PATH + '.corrupted'); } catch { try { fs.unlinkSync(STORE_PATH); } catch {} }
   }
 }
 
@@ -1007,7 +1042,7 @@ function normalizeToolChoice(raw) {
   return 'auto';
 }
 
-function buildChatRequest(body) {
+function buildChatRequest(body, preConvertedTools) {
   const messages = [];
   if (body.instructions) messages.push({ role: 'system', content: String(body.instructions) });
 
@@ -1047,11 +1082,28 @@ function buildChatRequest(body) {
           }
         }
       }
-      const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
+      // Skip ALL leading system messages from previous history.
+      // They are already covered by current instructions + injected prompt.
+      // If we only skip 1 but there are 2+ system messages (instructions +
+      // injected prompt), the extras get duplicated each turn, growing the
+      // conversation by one system msg/turn → KV cache prefix NEVER matches.
+      let startIdx = 0;
+      if (messages.length > 0) {
+        while (startIdx < previous.length && previous[startIdx]?.role === 'system') {
+          startIdx++;
+        }
+      }
       for (let i = startIdx; i < previous.length; i++) messages.push(sanitizeReplayedMessage(previous[i]));
       messages.push(...convertInputItems(newItems));
     } else {
-      const startIdx = messages.length > 0 && previous[0]?.role === 'system' ? 1 : 0;
+      // Skip ALL leading system messages from previous history.
+      // Same rationale as above — prevents KV cache prefix poisoning.
+      let startIdx = 0;
+      if (messages.length > 0) {
+        while (startIdx < previous.length && previous[startIdx]?.role === 'system') {
+          startIdx++;
+        }
+      }
       for (let i = startIdx; i < previous.length; i++) messages.push(sanitizeReplayedMessage(previous[i]));
       messages.push(...convertInputItems(body.input));
     }
@@ -1092,7 +1144,10 @@ function buildChatRequest(body) {
   // DeepSeek's thinking mode is incompatible with temperature.
   req.thinking = { type: 'enabled' };
 
-  const tools = convertTools(body.tools);
+  const tools = preConvertedTools || convertTools(body.tools);
+  // Stash converted tools on the request object so downstream (logUsage/diagnoseCachePrefix)
+  // can access the actual DeepSeek-facing tool definitions for accurate cache diagnostics.
+  req._convertedTools = tools;
   if (tools) {
     // Hard assertion: DeepSeek only supports type=function tools.
     // If any non-function tool leaks through, log and drop before sending.
@@ -1302,7 +1357,7 @@ function responseFromChat(body, chatReq, chatResp) {
   }
   rememberResponse(id, stored, outputItems);
   const prefixHash = cachePrefixHash(body);
-  logUsage(id, chatResp.usage, prefixHash, diagnoseCachePrefix(body, prefixHash));
+  logUsage(id, chatResp.usage, prefixHash, diagnoseCachePrefix(body, prefixHash, chatReq._convertedTools));
   return response;
 }
 
@@ -1570,7 +1625,7 @@ async function streamResponseFromChat(body, chatReq, res) {
   }
   rememberResponse(id, stored, outputItems);
   const prefixHash = cachePrefixHash(body);
-  logUsage(id, usage, prefixHash, diagnoseCachePrefix(body, prefixHash));
+  logUsage(id, usage, prefixHash, diagnoseCachePrefix(body, prefixHash, chatReq._convertedTools));
   writeSse(res, 'response.completed', { response });
   res.write('data: [DONE]\n\n');
   res.end();
@@ -1581,16 +1636,25 @@ async function handleResponses(req, res) {
     const body = await readJson(req);
     const requestedModel = body.model || DEEPSEEK_MODEL;
     const model = normalizeDeepSeekModel(requestedModel);
-    const prefixHash = cachePrefixHash(body);
-  log(`POST ${req.url} model=${requestedModel}${model !== requestedModel ? `->${model}` : ''} stream=${Boolean(body.stream)} prev=${body.previous_response_id || ''} prefix=${prefixHash} input=${summarizeInput(body.input)} tools=${Array.isArray(body.tools) ? body.tools.length : 0} parallel=${body.parallel_tool_calls !== false}`);
-  // Store prefix data for cache miss diagnostics
+    // Convert tools FIRST so the cache prefix hash matches what DeepSeek actually receives.
+    // Raw Codex tools may differ in order/structure while producing identical converted tools;
+    // hashing the converted (sorted, compiled) tools gives an accurate KV-cache signal.
+    const convertedTools = convertTools(body.tools);
+    const prefixHash = cachePrefixHash(body, convertedTools);
+    const rawToolsCount = Array.isArray(body.tools) ? body.tools.length : 0;
+    const convertedToolsCount = convertedTools ? convertedTools.length : 0;
+  log(`POST ${req.url} model=${requestedModel}${model !== requestedModel ? `->${model}` : ''} stream=${Boolean(body.stream)} prev=${body.previous_response_id || ''} prefix=${prefixHash} input=${summarizeInput(body.input)} tools_raw=${rawToolsCount} tools_converted=${convertedToolsCount} parallel=${body.parallel_tool_calls !== false}`);
+  // Store converted-tool signature for cache miss root-cause diagnostics.
+  // Written under prevKey:data so diagnoseCachePrefix can diff against it
+  // when the prefix hash changes between requests sharing the same previous_response_id.
   if (body.previous_response_id) {
     _cachePrefixHistory.set(body.previous_response_id + ':data', {
-      tools: (body.tools || []).map(t => t.name||t.type).sort().join(','),
-      instructions: (body.instructions || '').replace(/\s+/g, ' ').trim(),
+      toolsSig: (convertedTools || []).map(t => t.function?.name || t.name || '').sort().join(','),
+      instrSig: (body.instructions || '').replace(/\s+/g, ' ').trim(),
+      injected: process.env.DEEPSEEK_INJECT_SYSTEM_PROMPT || '',
     });
   }
-    const chatReq = buildChatRequest(body);
+    const chatReq = buildChatRequest(body, convertedTools);
     if (body.stream) {
       await streamResponseFromChat(body, chatReq, res);
       return;
